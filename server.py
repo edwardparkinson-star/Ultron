@@ -22,17 +22,20 @@ Env (.env supported):
     SHODAN_API_KEY  optional — enables /shodan/{ip} lookups
     ULTRON_API_KEY  REQUIRED — the server refuses to boot without it, and
                     every command endpoint rejects callers without it.
+    ULTRON_DATA_DIR file vault for uploads (default ~/ultron-data)
 """
 
 import hmac
 import os
+import re
 import socket
+import sqlite3
 import threading
 from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, File, HTTPException, Security, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
@@ -289,6 +292,101 @@ async def port_forward_stop(local_port: int):
                             detail="No forward on that port.")
     fw["stop"].set()
     return {"status": "stopped", "local_port": local_port}
+
+
+# ---- file vault + database query (permission-gated) ----
+# Upload intelligence databases / files to the server, list them, run
+# read-only SQL against uploaded SQLite databases, delete them.
+
+DATA_DIR = os.environ.get("ULTRON_DATA_DIR",
+                           os.path.expanduser("~/ultron-data"))
+os.makedirs(DATA_DIR, exist_ok=True)
+MAX_UPLOAD = 100 * 1024 * 1024  # 100 MB
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_name(name):
+    name = os.path.basename(name or "upload.bin")
+    name = _SAFE_NAME.sub("_", name).strip("._") or "upload.bin"
+    return name[:120]
+
+
+class Query(BaseModel):
+    db: str
+    sql: str
+
+
+@app.post("/upload", dependencies=[Depends(require_permission)])
+async def upload_file(file: UploadFile = File(...)):
+    """Store an uploaded file in the vault (100 MB max)."""
+    dest = os.path.join(DATA_DIR, _safe_name(file.filename))
+    if not os.path.abspath(dest).startswith(os.path.abspath(DATA_DIR)):
+        raise HTTPException(status_code=400, detail="Bad filename.")
+    size = 0
+    try:
+        with open(dest, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 256)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD:
+                    raise HTTPException(status_code=413,
+                                        detail="File too large (100 MB max).")
+                f.write(chunk)
+    except HTTPException:
+        if os.path.exists(dest):
+            os.unlink(dest)
+        raise
+    return {"status": "stored", "name": os.path.basename(dest),
+            "bytes": size}
+
+
+@app.get("/files", dependencies=[Depends(require_permission)])
+async def list_files():
+    """List files in the vault."""
+    out = []
+    for n in sorted(os.listdir(DATA_DIR)):
+        p = os.path.join(DATA_DIR, n)
+        if os.path.isfile(p):
+            st = os.stat(p)
+            out.append({"name": n, "bytes": st.st_size,
+                        "modified": int(st.st_mtime)})
+    return {"files": out, "dir": DATA_DIR}
+
+
+@app.delete("/files/{name}", dependencies=[Depends(require_permission)])
+async def delete_file(name: str):
+    """Delete a file from the vault."""
+    dest = os.path.join(DATA_DIR, _safe_name(name))
+    if not os.path.isfile(dest):
+        raise HTTPException(status_code=404, detail="No such file.")
+    os.unlink(dest)
+    return {"status": "deleted", "name": os.path.basename(dest)}
+
+
+@app.post("/query", dependencies=[Depends(require_permission)])
+async def query_db(q: Query):
+    """Read-only SQL against an uploaded SQLite database."""
+    if not q.sql.strip().lower().startswith("select"):
+        raise HTTPException(status_code=400,
+                            detail="Read-only: only SELECT queries allowed.")
+    dest = os.path.join(DATA_DIR, _safe_name(q.db))
+    if not os.path.isfile(dest):
+        raise HTTPException(status_code=404,
+                            detail="No such database. Upload it first.")
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % dest, uri=True)
+        con.row_factory = sqlite3.Row
+        cur = con.execute(q.sql)
+        rows = [dict(r) for r in cur.fetchmany(200)]
+        cols = [d[0] for d in cur.description] if cur.description else []
+        con.close()
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=400, detail="SQL error: %s" % e)
+    return {"columns": cols, "rows": rows,
+            "truncated": len(rows) == 200}
 
 
 if __name__ == "__main__":
