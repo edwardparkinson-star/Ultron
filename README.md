@@ -44,6 +44,31 @@ curl -X DELETE localhost:8000/port-forward/8554 -H 'X-API-Key: YOUR_KEY'
 
 Then view the camera at `127.0.0.1:8554` as if it were local.
 
+## File vault + database query
+
+Upload intelligence files and databases to the server, then query them.
+Files land in `~/ultron-data` (override with `ULTRON_DATA_DIR`), 100 MB
+max per file. Filenames are sanitized — no path escapes. `/query` is
+read-only: only `SELECT` statements run, against the database in
+read-only mode. All four endpoints need the `X-API-Key` header.
+
+```bash
+# upload a database (or any file)
+curl -X POST localhost:8000/upload -H 'X-API-Key: YOUR_KEY' \
+  -F 'file=@intel.db;filename=intel.db'
+
+# list the vault
+curl localhost:8000/files -H 'X-API-Key: YOUR_KEY'
+
+# read-only SQL against an uploaded SQLite database
+curl -X POST localhost:8000/query -H 'X-API-Key: YOUR_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"db":"intel.db","sql":"SELECT * FROM assets"}'
+
+# delete one
+curl -X DELETE localhost:8000/files/intel.db -H 'X-API-Key: YOUR_KEY'
+```
+
 ## Run it (GitHub Codespaces)
 
 1. Open this repo → green **Code** button → **Codespaces** → create one.
