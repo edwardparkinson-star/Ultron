@@ -26,6 +26,8 @@ Env (.env supported):
 
 import hmac
 import os
+import socket
+import threading
 from contextlib import asynccontextmanager
 
 import httpx
@@ -153,6 +155,140 @@ async def shodan_lookup(ip: str):
         "ports": host.get("ports"),
         "hostnames": host.get("hostnames"),
     }
+
+
+# ---------------------------------------------------------------- port forward
+# Local TCP relay: 127.0.0.1:<local_port> -> <target_host>:<target_port>.
+# The listening side binds to localhost ONLY — a forwarded port is never
+# exposed to the network, only to this machine. For reaching cameras and
+# devices you own without punching holes in anything.
+
+_forwards = {}  # local_port -> {stop, thread, target_host, target_port}
+
+
+def _pump(src, dst, stop):
+    try:
+        while not stop.is_set():
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+
+
+def _handle_client(client, target_host, target_port, stop):
+    try:
+        upstream = socket.create_connection((target_host, target_port),
+                                            timeout=10)
+    except OSError:
+        try:
+            client.close()
+        except OSError:
+            pass
+        return
+    t1 = threading.Thread(target=_pump, args=(client, upstream, stop),
+                          daemon=True)
+    t2 = threading.Thread(target=_pump, args=(upstream, client, stop),
+                          daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    for s in (client, upstream):
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _serve_forward(srv, target_host, target_port, stop):
+    srv.listen(20)
+    srv.settimeout(1.0)
+    while not stop.is_set():
+        try:
+            client, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        threading.Thread(target=_handle_client,
+                         args=(client, target_host, target_port, stop),
+                         daemon=True).start()
+    try:
+        srv.close()
+    except OSError:
+        pass
+
+
+def _valid_port(p):
+    return isinstance(p, int) and 1 <= p <= 65535
+
+
+class PortForward(BaseModel):
+    target_host: str   # camera / device address, e.g. "192.168.1.50"
+    target_port: int   # its port, e.g. 554 for RTSP
+    local_port: int    # local port you open, e.g. 8554
+
+
+@app.post("/port-forward", dependencies=[Depends(require_permission)])
+async def port_forward_start(pf: PortForward):
+    """Open 127.0.0.1:<local_port> relaying to <target_host>:<target_port>."""
+    host = pf.target_host.strip()
+    if not host:
+        raise HTTPException(status_code=400,
+                            detail="target_host is required.")
+    if not _valid_port(pf.target_port) or not _valid_port(pf.local_port):
+        raise HTTPException(status_code=400,
+                            detail="Ports must be 1-65535.")
+    if pf.local_port == 8000:
+        raise HTTPException(status_code=400,
+                            detail="Cannot forward the server's own port.")
+    if pf.local_port in _forwards:
+        raise HTTPException(status_code=409,
+                            detail=f"Port {pf.local_port} already forwarded.")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", pf.local_port))
+    except OSError as e:
+        srv.close()
+        raise HTTPException(status_code=409,
+                            detail=f"Cannot bind local port "
+                                   f"{pf.local_port}: {e}")
+    stop = threading.Event()
+    t = threading.Thread(target=_serve_forward,
+                         args=(srv, host, pf.target_port, stop),
+                         daemon=True)
+    t.start()
+    _forwards[pf.local_port] = {"stop": stop, "thread": t,
+                                "target_host": host,
+                                "target_port": pf.target_port}
+    return {"status": "forwarding",
+            "listen": f"127.0.0.1:{pf.local_port}",
+            "target": f"{host}:{pf.target_port}"}
+
+
+@app.get("/port-forwards", dependencies=[Depends(require_permission)])
+async def port_forward_list():
+    """List active forwards."""
+    return {"forwards": [
+        {"local_port": p, "listen": f"127.0.0.1:{p}",
+         "target": f"{v['target_host']}:{v['target_port']}",
+         "alive": v["thread"].is_alive()}
+        for p, v in _forwards.items()]}
+
+
+@app.delete("/port-forward/{local_port}",
+            dependencies=[Depends(require_permission)])
+async def port_forward_stop(local_port: int):
+    """Stop a forward."""
+    fw = _forwards.pop(local_port, None)
+    if fw is None:
+        raise HTTPException(status_code=404,
+                            detail="No forward on that port.")
+    fw["stop"].set()
+    return {"status": "stopped", "local_port": local_port}
 
 
 if __name__ == "__main__":
