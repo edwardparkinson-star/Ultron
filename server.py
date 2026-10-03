@@ -31,7 +31,9 @@ import re
 import socket
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager
+from typing import Any, Dict, List
 
 import httpx
 from dotenv import load_dotenv
@@ -387,6 +389,128 @@ async def query_db(q: Query):
         raise HTTPException(status_code=400, detail="SQL error: %s" % e)
     return {"columns": cols, "rows": rows,
             "truncated": len(rows) == 200}
+
+
+# ---- camera watchdog (defensive: YOUR cameras only) ----
+# Registers cameras you own and TCP-checks each one every 5 seconds.
+# This is monitoring, not intrusion: plain connectivity checks, no logins,
+# no credentials, no stream access. State changes (online<->OFFLINE) are
+# timestamped into an event log. Re-register after a server restart.
+
+WATCH_INTERVAL = 5  # seconds between sweeps
+WATCH_TIMEOUT = 3   # seconds per connect attempt
+
+_watch = {"cameras": [], "status": {}, "events": [],
+          "running": False, "thread": None, "lock": threading.Lock()}
+
+
+def _watch_probe(host, port):
+    start = time.time()
+    try:
+        s = socket.create_connection((host, port), timeout=WATCH_TIMEOUT)
+        s.close()
+        return True, int((time.time() - start) * 1000)
+    except Exception:
+        return False, None
+
+
+def _watch_loop():
+    while True:
+        with _watch["lock"]:
+            if not _watch["running"]:
+                break
+            cams = list(_watch["cameras"])
+        for cam in cams:
+            ok, ms = _watch_probe(cam["host"], cam["port"])
+            now = int(time.time())
+            with _watch["lock"]:
+                st = _watch["status"].get(cam["name"], {})
+                prev = st.get("online")
+                st.update({"online": ok, "latency_ms": ms,
+                           "last_check": now,
+                           "host": cam["host"], "port": cam["port"]})
+                if prev is None or prev != ok:
+                    st["last_change"] = now
+                    if prev is not None:
+                        _watch["events"].append(
+                            {"time": now, "camera": cam["name"],
+                             "event": "online" if ok else "OFFLINE"})
+                        _watch["events"] = _watch["events"][-50:]
+                _watch["status"][cam["name"]] = st
+        for _ in range(WATCH_INTERVAL * 2):  # prompt stop
+            with _watch["lock"]:
+                if not _watch["running"]:
+                    return
+            time.sleep(0.5)
+
+
+def _watch_stop():
+    with _watch["lock"]:
+        _watch["running"] = False
+        t = _watch["thread"]
+    if t and t.is_alive():
+        t.join(timeout=5)
+    with _watch["lock"]:
+        _watch["thread"] = None
+
+
+class WatchCamera(BaseModel):
+    name: str                    # label, e.g. "front-door"
+    host: str                    # camera address, e.g. "192.168.1.50"
+    port: int                    # its port, e.g. 554
+
+
+class WatchList(BaseModel):
+    cameras: List[WatchCamera]
+
+
+@app.post("/watch", dependencies=[Depends(require_permission)])
+async def watch_start(wl: WatchList):
+    """Register YOUR cameras and start the 5-second watchdog."""
+    cams = []
+    seen = set()
+    for c in wl.cameras[:50]:
+        name = c.name.strip()[:60]
+        host = c.host.strip()
+        if not name or not host or name in seen:
+            raise HTTPException(status_code=400,
+                                detail="Each camera needs a unique name and host.")
+        if not _valid_port(c.port):
+            raise HTTPException(status_code=400,
+                                detail="Port %r out of range." % c.port)
+        seen.add(name)
+        cams.append({"name": name, "host": host, "port": c.port})
+    if not cams:
+        raise HTTPException(status_code=400,
+                            detail="No cameras given.")
+    _watch_stop()
+    with _watch["lock"]:
+        _watch["cameras"] = cams
+        _watch["status"] = {}
+        _watch["events"] = []
+        _watch["running"] = True
+        t = threading.Thread(target=_watch_loop, daemon=True)
+        _watch["thread"] = t
+        t.start()
+    return {"status": "watching", "cameras": len(cams),
+            "interval_s": WATCH_INTERVAL}
+
+
+@app.get("/watch", dependencies=[Depends(require_permission)])
+async def watch_status():
+    """Current watchdog state + recent online/OFFLINE transitions."""
+    with _watch["lock"]:
+        return {"running": _watch["running"],
+                "interval_s": WATCH_INTERVAL,
+                "cameras": dict(_watch["status"]),
+                "events": list(_watch["events"])}
+
+
+@app.delete("/watch", dependencies=[Depends(require_permission)])
+async def watch_stop():
+    """Stop the watchdog."""
+    _watch_stop()
+    return {"status": "stopped"}
 
 
 if __name__ == "__main__":
