@@ -8,7 +8,7 @@ your local machine.
 
 | File | Purpose |
 |---|---|
-| `server.py` | Cloud brain: `POST /command` answers via Ollama; `GET /shodan/{ip}` host intel (needs `SHODAN_API_KEY`) |
+| `server.py` | Cloud brain: `POST /command` answers via Ollama; `GET /shodan/{ip}` host intel (needs `SHODAN_API_KEY`); port-forward endpoints (see below) |
 | `client.py` | Local client: hears "hey jarvis", transcribes with faster-whisper, speaks replies with edge-tts |
 | `requirements-server.txt` / `requirements-client.txt` | pip deps for each side |
 | `.env.example` | copy to `.env` — keys live there, never in code |
@@ -21,6 +21,28 @@ plus `/shodan/{ip}` reject any caller that doesn't send the same key as
 the `X-API-Key` header (403 otherwise). The client reads the key from its
 own `ULTRON_API_KEY` env var. See `LICENSE`: possession of the code does
 not grant the right to run it.
+
+
+## Port forward to a camera
+
+Open a local port that relays to a camera or device you own. The relay
+listens on **127.0.0.1 only** — never exposed to the network. All three
+endpoints need the `X-API-Key` header like everything else.
+
+```bash
+# forward local 8554 -> camera at 192.168.1.50:554 (RTSP)
+curl -X POST localhost:8000/port-forward \
+  -H 'Content-Type: application/json' -H 'X-API-Key: YOUR_KEY' \
+  -d '{"target_host":"192.168.1.50","target_port":554,"local_port":8554}'
+
+# list active forwards
+curl localhost:8000/port-forwards -H 'X-API-Key: YOUR_KEY'
+
+# stop one
+curl -X DELETE localhost:8000/port-forward/8554 -H 'X-API-Key: YOUR_KEY'
+```
+
+Then view the camera at `127.0.0.1:8554` as if it were local.
 
 ## Run it (GitHub Codespaces)
 
