@@ -69,6 +69,28 @@ curl -X POST localhost:8000/query -H 'X-API-Key: YOUR_KEY' \
 curl -X DELETE localhost:8000/files/intel.db -H 'X-API-Key: YOUR_KEY'
 ```
 
+## Camera watchdog
+
+Defensive monitoring for cameras **you own**. Register them once and the
+server TCP-checks each one every 5 seconds — plain connectivity, no logins,
+no credentials, no stream access. Every online↔OFFLINE flip is timestamped
+into an event log (last 50). Re-register after a server restart; all three
+endpoints need the `X-API-Key` header.
+
+```bash
+# register your cameras and start the watchdog
+curl -X POST localhost:8000/watch -H 'X-API-Key: YOUR_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"cameras":[{"name":"front-door","host":"192.168.1.50","port":554},
+                  {"name":"driveway","host":"192.168.1.51","port":554}]}'
+
+# check status + recent OFFLINE events
+curl localhost:8000/watch -H 'X-API-Key: YOUR_KEY'
+
+# stop it
+curl -X DELETE localhost:8000/watch -H 'X-API-Key: YOUR_KEY'
+```
+
 ## Run it (GitHub Codespaces)
 
 1. Open this repo → green **Code** button → **Codespaces** → create one.
