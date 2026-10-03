@@ -108,7 +108,9 @@ async def process_command(cmd: Command):
     if not text:
         raise HTTPException(status_code=400, detail="Empty command.")
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
+        # trust_env=False: ignore proxy env vars (a malformed no_proxy
+        # breaks httpx with "Invalid port" on some hosts).
+        async with httpx.AsyncClient(timeout=90.0, trust_env=False) as client:
             payload = {
                 "model": DEFAULT_MODEL,
                 "prompt": (
